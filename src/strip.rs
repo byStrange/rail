@@ -167,3 +167,68 @@ impl ShellLayout {
         self.imp().side.set(v);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workspaces: strips stacked vertically, one screen tall each. `pos` is the
+// (fractional) index of the workspace on screen, so animating it slides between
+// them. Workspaces that are fully off screen are hidden so they stop painting.
+// ---------------------------------------------------------------------------
+
+mod stack_imp {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    pub struct StackLayout {
+        pub pos: Cell<f64>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for StackLayout {
+        const NAME: &'static str = "RailStackLayout";
+        type Type = super::StackLayout;
+        type ParentType = gtk::LayoutManager;
+    }
+
+    impl ObjectImpl for StackLayout {}
+
+    impl LayoutManagerImpl for StackLayout {
+        fn measure(&self, _w: &gtk::Widget, _o: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+            (0, 0, -1, -1)
+        }
+
+        fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _baseline: i32) {
+            let pos = self.pos.get();
+            let mut child = widget.first_child();
+            let mut i = 0.0;
+            while let Some(c) = child {
+                let d = i - pos;
+                if d.abs() >= 1.0 {
+                    c.set_child_visible(false);
+                } else {
+                    c.set_child_visible(true);
+                    let t = gsk::Transform::new().translate(&graphene::Point::new(0.0, (d * height as f64) as f32));
+                    c.allocate(width, height, -1, Some(t));
+                }
+                i += 1.0;
+                child = c.next_sibling();
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct StackLayout(ObjectSubclass<stack_imp::StackLayout>) @extends gtk::LayoutManager;
+}
+
+impl StackLayout {
+    pub fn new() -> Self {
+        glib::Object::new()
+    }
+    pub fn pos(&self) -> f64 {
+        self.imp().pos.get()
+    }
+    pub fn set_pos(&self, v: f64) {
+        self.imp().pos.set(v);
+    }
+}

@@ -12,7 +12,11 @@ your system**, so the program itself is only ~450 KB and it ships no browser eng
 - one native binary, no Electron, no bundled Chromium
 - tabs on a niri-style scrolling strip, with a live zoomed-out overview
 - keyboard-first (vim-style `h` / `l`), no title bar, no toolbar, nothing but the page
-- starts fresh every time: one empty tab, no session restore
+- **workspaces**: stacked strips, each with its own endless row of tabs; name them, jump with `Ctrl+1`…`9`
+- **group by site**: `app.example.com`, `example.com` and `example.com/x` land together
+- address bar with history **autocomplete** (inline completion + suggestions)
+- **downloads** with a panel, progress, open / show-in-folder
+- starts fresh every time: one empty tab, no session restore (workspace names are remembered)
 - logins are kept between runs (cookies are stored on disk)
 
 > **Platform:** Linux only (GTK4 + WebKitGTK). Developed on Wayland (niri); X11 should work too.
@@ -85,6 +89,29 @@ Everything is on the keyboard. The page has no toolbar; the address bar appears 
 | `Ctrl+R` | Reload |
 | `Alt+Left` / `Alt+Right` | Back / forward |
 
+### Workspaces
+
+Workspaces are strips stacked on top of each other (like niri's). The sidebar lists them.
+
+| Key | Action |
+|---|---|
+| `Ctrl+1` … `Ctrl+9` | Go to workspace N (the next free number creates it) |
+| `Ctrl+Shift+1` … `9` | Move the focused tab to workspace N |
+| `Ctrl+Alt+J` / `Ctrl+Alt+K` | Workspace below / above |
+| `F2` | Rename the current workspace |
+| `Ctrl+Alt+W` | Close the current workspace and its tabs |
+| `Ctrl+Shift+G` | Group tabs by site (stays on while you browse; press again to stop) |
+
+### Address bar and downloads
+
+| Key | Action |
+|---|---|
+| typing | Completes inline from history (`git` → `github.com`); `Backspace` removes the suggestion |
+| `↑` / `↓` | Walk the history suggestions |
+| `Ctrl+Shift+D` | Downloads panel (also the button in the sidebar) |
+
+Files go to your XDG Downloads folder (`~/Downloads` by default).
+
 ### Overview
 
 | Key | Action |
@@ -109,8 +136,9 @@ The window has no title bar, so `Ctrl+Q` is how you close it.
 
 ## Where your data goes
 
-Cookies (so you stay logged in) are stored in `~/.local/share/rail/`. Delete that
-folder to log out of everything. Nothing is restored on startup except those cookies.
+`~/.local/share/rail/` holds cookies (so you stay logged in), `history.tsv` (address
+autocomplete), `downloads.txt` (the downloads list) and `workspaces.txt` (workspace names).
+Delete the folder to reset everything. Open tabs are never restored.
 
 ## Troubleshooting
 
@@ -141,8 +169,9 @@ fix is a custom user agent for `accounts.google.com`.
 ## Project layout
 
 ```
-src/main.rs                    the app: tabs, sidebar, address bar, overview, keys
-src/strip.rs                   custom GTK layouts: the scrolling strip and the sliding sidebar
+src/main.rs                    the app: workspaces, tabs, sidebar, address bar, downloads, keys
+src/history.rs                 history log, autocomplete, site (domain) grouping key
+src/strip.rs                   custom GTK layouts: scrolling strip, workspace stack, sliding sidebar
 packaging/build-appimage.sh    experimental AppImage builder (see below)
 ```
 
@@ -156,7 +185,7 @@ For everyday use, build from source as described above.
 ## Not done yet
 
 - No ad blocking, private mode, multiple profiles or password manager.
-- No find-in-page, bookmarks, history UI or download manager.
+- No find-in-page, bookmarks or full history page.
 - Tabs are never suspended, so every open tab stays in memory.
 - `Ctrl+J` / `Ctrl+K` are unused (reserved for stacked tabs in a column).
 - A failed page load shows WebKit's plain default error page.
