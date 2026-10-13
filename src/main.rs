@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
-use strip::{SIDE_W, ShellLayout, StackLayout, StripLayout, col_width, gap};
+use strip::{OV_ZOOM, SIDE_W, ShellLayout, StackLayout, StripLayout, col_width, gap, stack_pitch};
 use webkit6::prelude::*;
 use webkit6::WebView;
 
@@ -122,7 +122,9 @@ entry.palette-entry selection { background: rgba(122,162,247,0.35); color: #c0ca
 
 /* ---- overview (the live strip, zoomed out) ---- */
 .zoomed .tab { opacity: 0.88; border-radius: 28px; }
-.zoomed .tab.focused { opacity: 1; outline: 7px solid #7aa2f7; outline-offset: -5px; }
+.zoomed .tab.focused { opacity: 1; outline: 7px solid #3b4261; outline-offset: -5px; }
+.zoomed.curws .tab.focused { outline-color: #7aa2f7; }
+.zoomed:not(.curws) .tab { opacity: 0.6; }
 .ov-hint { background: #1a1b26; color: #8089b3; border: 1px solid #2f334d; border-radius: 10px;
            padding: 8px 16px; font-size: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
 
@@ -155,8 +157,6 @@ button.dl-clear { background: transparent; border: none; box-shadow: none; color
 button.dl-clear:hover { background: #2a2e45; color: #c0caf5; }
 ";
 
-/// How far the strip zooms out in overview (niri uses a similar factor).
-const OV_ZOOM: f64 = 0.4;
 const MAX_WS: usize = 9;
 
 #[derive(Clone)]
@@ -173,6 +173,8 @@ struct Ws {
     focus: Cell<usize>,
     target: Cell<f64>,
     animating: Cell<bool>,
+    /// Scroll position before the overview, restored when zooming back in.
+    saved: Cell<f64>,
     /// Keep tabs of the same site next to each other.
     grouped: Cell<bool>,
 }
@@ -241,10 +243,8 @@ struct App {
     ov_hint: gtk::Label,
     /// Overview is active: the strip is zoomed out and tabs ignore the pointer.
     ov: Cell<bool>,
-    /// Tab that was focused when overview opened; Esc returns here.
-    ov_return: Cell<usize>,
-    /// Scroll position before the overview, restored when zooming back in.
-    ov_saved: Cell<f64>,
+    /// (workspace, tab) that was focused when overview opened; Esc returns here.
+    ov_return: Cell<(usize, usize)>,
     target_zoom: Cell<f64>,
     side_open: Cell<bool>,
     side_gen: Cell<u32>,
@@ -341,8 +341,7 @@ impl App {
         if vw <= 0.0 {
             return;
         }
-        let is_cur = Rc::ptr_eq(&self.ws(), ws);
-        let (zoom, ov) = if is_cur { (self.target_zoom.get(), self.ov.get()) } else { (1.0, false) };
+        let (zoom, ov) = (self.target_zoom.get(), self.ov.get());
         let visible = vw / zoom; // strip width that fits on screen
         let g = gap(zoom);
         let tabs = ws.tabs.borrow();
@@ -384,7 +383,7 @@ impl App {
             return;
         }
         let near = |a: f64, b: f64, eps: f64| (a - b).abs() < eps;
-        let zt = if Rc::ptr_eq(&self.ws(), ws) { self.target_zoom.get() } else { 1.0 };
+        let zt = self.target_zoom.get();
         if near(ws.target.get(), ws.layout.offset(), 0.5) && near(zt, ws.layout.zoom(), 0.002) {
             ws.layout.set_offset(ws.target.get());
             ws.layout.set_zoom(zt);
@@ -402,7 +401,7 @@ impl App {
             let w = (strip.width() as f64).max(1.0);
             let (oc, ot) = (ws.layout.offset(), ws.target.get());
             let zc = ws.layout.zoom();
-            let zt = if Rc::ptr_eq(&app.ws(), ws) { app.target_zoom.get() } else { 1.0 };
+            let zt = app.target_zoom.get();
             // Animate the camera *center* (the strip point at screen center), not the
             // left edge: then zooming pivots on the middle of the screen instead of
             // visibly shrinking toward the left and sliding into place.
@@ -447,27 +446,35 @@ impl App {
             focus: Cell::new(usize::MAX),
             target: Cell::new(0.0),
             animating: Cell::new(false),
+            saved: Cell::new(0.0),
             grouped: Cell::new(false),
         });
         let (a, w) = (self.clone(), ws.clone());
         layout.connect_resized(move || a.reveal_ws(&w));
 
-        // In overview, clicking a (non-interactive) zoomed tab selects it.
-        let pick = gtk::GestureClick::new();
-        let a = self.clone();
-        pick.connect_released(move |_, _, x, _| {
-            if a.ov.get() {
-                a.ov_click(x);
-            }
-        });
-        strip.add_controller(pick);
+        if self.ov.get() {
+            strip.add_css_class("zoomed");
+            layout.set_zoom(OV_ZOOM);
+        }
 
         self.stack.append(&strip);
         self.wss.borrow_mut().push(ws);
+        self.mark_cur();
         self.wss.borrow().len() - 1
     }
 
-    /// Slide the workspace stack to the current workspace.
+    /// The current workspace's strip gets the `curws` class (overview highlights it).
+    fn mark_cur(&self) {
+        for (i, w) in self.wss.borrow().iter().enumerate() {
+            if i == self.cur.get() {
+                w.strip.add_css_class("curws");
+            } else {
+                w.strip.remove_css_class("curws");
+            }
+        }
+    }
+
+    /// Slide (and, for overview, zoom) the workspace stack toward its targets.
     fn animate_stack(self: &Rc<Self>) {
         if self.stack_anim.replace(true) {
             return;
@@ -479,12 +486,16 @@ impl App {
             let dt = last.replace(Some(now)).map_or(1.0 / 60.0, |l| (now - l) as f64 / 1e6);
             let k = 1.0 - (-dt / 0.07).exp();
             let (t, p) = (app.cur.get() as f64, app.stack_layout.pos());
+            let (zt, zc) = (app.target_zoom.get(), app.stack_layout.zoom());
             let mut n = p + (t - p) * k;
-            let done = (t - n).abs() < 0.002;
+            let mut z = zc + (zt - zc) * k;
+            let done = (t - n).abs() < 0.002 && (zt - z).abs() < 0.002;
             if done {
                 n = t;
+                z = zt;
             }
             app.stack_layout.set_pos(n);
+            app.stack_layout.set_zoom(z);
             stack.queue_allocate();
             if done {
                 app.stack_anim.set(false);
@@ -506,45 +517,16 @@ impl App {
             return;
         }
         if i != self.cur.get() {
-            let was_ov = self.ov.get();
-            let old = self.ws();
-            if was_ov {
-                // Overview follows you: the old workspace zooms back in as it slides away.
-                old.strip.remove_css_class("zoomed");
-                for t in old.tabs.borrow().iter() {
-                    t.view.set_can_target(true);
-                }
-                old.target.set(self.ov_saved.get());
-            }
             self.palette.set_visible(false);
             self.cur.set(i);
+            self.mark_cur();
             self.animate_stack();
             let ws = self.ws();
             let len = ws.tabs.borrow().len();
-            if was_ov {
-                self.reveal_ws(&old);
-                if len == 0 {
-                    // Nothing to look at: leave overview and open a fresh tab.
-                    self.ov.set(false);
-                    self.ov_hint.set_visible(false);
-                    self.target_zoom.set(1.0);
-                } else {
-                    ws.strip.add_css_class("zoomed");
-                    for t in ws.tabs.borrow().iter() {
-                        t.view.set_can_target(false);
-                    }
-                    self.ov_saved.set(ws.target.get());
-                    ws.layout.set_zoom(OV_ZOOM);
-                    ws.layout.set_offset(ws.target.get());
-                }
-            }
-            if len == 0 {
-                self.new_tab();
-            } else {
+            if len > 0 {
                 self.focus_tab(ws.focus.get().min(len - 1));
-                if was_ov {
-                    self.ov_return.set(self.ws().focus.get());
-                }
+            } else if !self.ov.get() {
+                self.new_tab();
             }
             self.refresh_sidebar();
         }
@@ -587,6 +569,7 @@ impl App {
         }
         let left = src.tabs.borrow().len();
         src.focus.set(if left == 0 { usize::MAX } else { idx.saturating_sub(1).min(left - 1) });
+        self.reveal_ws(&src);
         // Always follow the moved tab, overview or not.
         self.switch_ws(i);
     }
@@ -610,6 +593,7 @@ impl App {
         self.stack.remove(&ws.strip);
         let new = i.saturating_sub(1);
         self.cur.set(new);
+        self.mark_cur();
         self.stack_layout.set_pos(new as f64);
         self.stack.queue_allocate();
         self.save_workspaces();
@@ -1471,21 +1455,27 @@ impl App {
     }
 
     fn enter_overview(self: &Rc<Self>) {
-        let ws = self.ws();
-        if self.ov.get() || ws.tabs.borrow().is_empty() {
+        if self.ov.get() || self.ws().tabs.borrow().is_empty() {
             return;
         }
         self.palette.set_visible(false);
         self.ov.set(true);
-        self.ov_return.set(ws.focus.get());
-        self.ov_saved.set(ws.target.get());
-        ws.strip.add_css_class("zoomed");
+        self.ov_return.set((self.cur.get(), self.ws().focus.get()));
         self.ov_hint.set_visible(true);
-        for t in ws.tabs.borrow().iter() {
-            t.view.set_can_target(false); // clicks pick a tab, they don't reach the page
-        }
         self.target_zoom.set(OV_ZOOM);
-        self.reveal_focus();
+        // Every workspace zooms out: the whole thing is one overview.
+        let all = self.wss.borrow().clone();
+        for ws in &all {
+            ws.saved.set(ws.target.get());
+            ws.strip.add_css_class("zoomed");
+            for t in ws.tabs.borrow().iter() {
+                t.view.set_can_target(false); // clicks pick a tab, they don't reach the page
+            }
+        }
+        self.animate_stack();
+        for ws in &all {
+            self.reveal_ws(ws);
+        }
     }
 
     /// Zoom back in on whichever tab is focused now.
@@ -1493,50 +1483,71 @@ impl App {
         if !self.ov.get() {
             return;
         }
-        let ws = self.ws();
         self.ov.set(false);
-        ws.strip.remove_css_class("zoomed");
         self.ov_hint.set_visible(false);
-        for t in ws.tabs.borrow().iter() {
-            t.view.set_can_target(true);
-        }
         self.target_zoom.set(1.0);
-        // Start from the pre-overview scroll: if the focus didn't move we land exactly
-        // where we left, otherwise we scroll the minimum to reveal the new tab.
-        ws.target.set(self.ov_saved.get());
-        self.reveal_focus();
-        if let Some(v) = self.focused_view() {
+        let all = self.wss.borrow().clone();
+        for ws in &all {
+            ws.strip.remove_css_class("zoomed");
+            for t in ws.tabs.borrow().iter() {
+                t.view.set_can_target(true);
+            }
+            // Start from the pre-overview scroll: if the focus didn't move we land exactly
+            // where we left, otherwise we scroll the minimum to reveal the new tab.
+            ws.target.set(ws.saved.get());
+        }
+        self.animate_stack();
+        for ws in &all {
+            self.reveal_ws(ws);
+        }
+        if self.ws().tabs.borrow().is_empty() {
+            self.new_tab(); // landed on an empty workspace
+        } else if let Some(v) = self.focused_view() {
             v.grab_focus();
         }
     }
 
     /// Esc: zoom back in on the tab you started from.
     fn cancel_overview(self: &Rc<Self>) {
-        let ws = self.ws();
-        let back = self.ov_return.get().min(ws.tabs.borrow().len().saturating_sub(1));
-        self.focus_tab(back);
+        let (w, t) = self.ov_return.get();
+        self.switch_ws(w);
+        let len = self.ws().tabs.borrow().len();
+        if len > 0 {
+            self.focus_tab(t.min(len - 1));
+        }
         self.exit_overview();
     }
 
     /// Click in overview: the tab under the pointer wins; empty space just exits.
-    fn ov_click(self: &Rc<Self>, x: f64) {
-        let ws = self.ws();
-        let vw = ws.strip.width() as f64;
-        let (z, off) = (ws.layout.zoom(), ws.layout.offset());
-        let g = gap(z);
-        let mut hit = None;
-        let mut cx = 0.0;
-        for (i, t) in ws.tabs.borrow().iter().enumerate() {
-            let w = col_width(t.view.has_css_class("full"), vw);
-            let left = (cx - off) * z;
-            if x >= left && x <= left + w * z {
-                hit = Some(i);
-                break;
+    /// (x, y) are in the workspace stack's coordinates.
+    fn ov_click(self: &Rc<Self>, x: f64, y: f64) {
+        let h = self.stack.height() as f64;
+        let z = self.stack_layout.zoom();
+        let pitch = stack_pitch(h, z);
+        let pos = self.stack_layout.pos();
+        let n = self.wss.borrow().len();
+        let band = (0..n).find(|&i| ((i as f64 - pos) * pitch + h / 2.0 - y).abs() <= h * z / 2.0);
+        if let Some(wi) = band {
+            self.switch_ws(wi);
+            let ws = self.ws();
+            let vw = ws.strip.width() as f64;
+            let (z, off) = (ws.layout.zoom(), ws.layout.offset());
+            let g = gap(z);
+            let x = x - ws.strip.margin_start() as f64;
+            let mut hit = None;
+            let mut cx = 0.0;
+            for (i, t) in ws.tabs.borrow().iter().enumerate() {
+                let w = col_width(t.view.has_css_class("full"), vw);
+                let left = (cx - off) * z;
+                if x >= left && x <= left + w * z {
+                    hit = Some(i);
+                    break;
+                }
+                cx += w + g;
             }
-            cx += w + g;
-        }
-        if let Some(i) = hit {
-            self.focus_tab(i);
+            if let Some(i) = hit {
+                self.focus_tab(i);
+            }
         }
         self.exit_overview();
     }
@@ -1554,6 +1565,14 @@ impl App {
                 }
                 gdk::Key::l | gdk::Key::Right => {
                     self.focus_tab(f + 1);
+                    return true;
+                }
+                gdk::Key::j | gdk::Key::Down => {
+                    self.switch_ws(self.cur.get() + 1);
+                    return true;
+                }
+                gdk::Key::k | gdk::Key::Up => {
+                    self.switch_ws(self.cur.get().saturating_sub(1));
                     return true;
                 }
                 _ => {}
@@ -1853,7 +1872,7 @@ fn build(gapp: &gtk::Application) {
     palette.set_visible(false);
 
     // ---- overview hint (the overview itself is the strip, zoomed) ----
-    let ov_hint = gtk::Label::new(Some("h / l  move      Enter  open      x  close      Esc  cancel"));
+    let ov_hint = gtk::Label::new(Some("h l  tabs      j k  workspaces      Enter  open      x  close      Esc  cancel"));
     ov_hint.add_css_class("ov-hint");
     ov_hint.set_halign(gtk::Align::Center);
     ov_hint.set_valign(gtk::Align::End);
@@ -1976,8 +1995,7 @@ fn build(gapp: &gtk::Application) {
         dl_pending: Cell::new(false),
         ov_hint,
         ov: Cell::new(false),
-        ov_return: Cell::new(0),
-        ov_saved: Cell::new(0.0),
+        ov_return: Cell::new((0, 0)),
         target_zoom: Cell::new(1.0),
         side_open: Cell::new(true),
         side_gen: Cell::new(0),
@@ -2029,6 +2047,16 @@ fn build(gapp: &gtk::Application) {
             a.navigate(&u);
         }
     });
+
+    // In overview, clicking a (non-interactive) zoomed tab selects it.
+    let pick = gtk::GestureClick::new();
+    let a = app.clone();
+    pick.connect_released(move |_, _, x, y| {
+        if a.ov.get() {
+            a.ov_click(x, y);
+        }
+    });
+    app.stack.add_controller(pick);
 
     // Clicking anywhere in the page area dismisses the address palette.
     let click = gtk::GestureClick::new();

@@ -116,8 +116,9 @@ Files go to your XDG Downloads folder (`~/Downloads` by default).
 
 | Key | Action |
 |---|---|
-| `Ctrl+O` | Zoom out to see every tab; press again to open the highlighted one |
-| `h` / `l` or arrows | Move between tabs |
+| `Ctrl+O` | Zoom out to see **every workspace and tab** at once; press again to open the highlighted one |
+| `h` / `l` or ← / → | Move between tabs |
+| `j` / `k` or ↓ / ↑ | Move between workspaces |
 | `Enter` / `Space` / click | Open the highlighted tab |
 | `x` / `Delete` | Close the highlighted tab |
 | `Esc` | Cancel and return to the tab you started from |
