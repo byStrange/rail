@@ -711,6 +711,11 @@ impl App {
             app.refresh_sidebar();
             app.update_load_bar();
         });
+        // A crashed or killed web process leaves a dead page; bring it back.
+        view.connect_web_process_terminated(|v, reason| {
+            eprintln!("rail: web process terminated ({reason:?}), reloading");
+            v.reload();
+        });
         let app = self.clone();
         view.connect_estimated_load_progress_notify(move |_| app.update_load_bar());
         let app = self.clone();
@@ -2087,7 +2092,23 @@ fn build(gapp: &gtk::Application) {
     win.present();
 }
 
+/// Rail is launched without a terminal, so a panic (which aborts inside GTK
+/// callbacks) would vanish silently. Leave a trace in `crash.log` instead.
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let bt = std::backtrace::Backtrace::force_capture();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir().join("crash.log")) {
+            let _ = writeln!(f, "--- panic at unix {t} ---\n{info}\n{bt}\n");
+        }
+        default(info);
+    }));
+}
+
 fn main() -> glib::ExitCode {
+    install_crash_log();
     let app = gtk::Application::builder()
         .application_id("dev.rail.browser")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
