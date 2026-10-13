@@ -9,6 +9,9 @@ use gtk4 as gtk;
 
 pub const GAP: f64 = 6.0;
 
+/// How far everything zooms out in overview.
+pub const OV_ZOOM: f64 = 0.4;
+
 /// Space between columns, in strip coordinates. It grows as the strip zooms
 /// out so scaled-down tabs keep a readable gap instead of nearly touching.
 pub fn gap(zoom: f64) -> f64 {
@@ -181,6 +184,8 @@ mod stack_imp {
     #[derive(Default)]
     pub struct StackLayout {
         pub pos: Cell<f64>,
+        /// 1.0 normally; OV_ZOOM in overview, where all workspaces are visible at once.
+        pub zoom: Cell<f64>,
     }
 
     #[glib::object_subclass]
@@ -199,15 +204,20 @@ mod stack_imp {
 
         fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _baseline: i32) {
             let pos = self.pos.get();
+            let z = self.zoom.get();
+            let h = height as f64;
+            let pitch = super::stack_pitch(h, z);
             let mut child = widget.first_child();
             let mut i = 0.0;
             while let Some(c) = child {
-                let d = i - pos;
-                if d.abs() >= 1.0 {
+                let y = (i - pos) * pitch;
+                // Each strip's content is centered in its own box; only skip strips
+                // whose (scaled) content is entirely off screen.
+                if y.abs() >= h * (1.0 + z) / 2.0 {
                     c.set_child_visible(false);
                 } else {
                     c.set_child_visible(true);
-                    let t = gsk::Transform::new().translate(&graphene::Point::new(0.0, (d * height as f64) as f32));
+                    let t = gsk::Transform::new().translate(&graphene::Point::new(0.0, y as f32));
                     c.allocate(width, height, -1, Some(t));
                 }
                 i += 1.0;
@@ -221,9 +231,23 @@ glib::wrapper! {
     pub struct StackLayout(ObjectSubclass<stack_imp::StackLayout>) @extends gtk::LayoutManager;
 }
 
+/// Distance between workspace centers: a full screen normally, and in overview
+/// the scaled-down height plus a gap so the bands read as separate rows.
+pub fn stack_pitch(height: f64, zoom: f64) -> f64 {
+    height * zoom + (1.0 - zoom) * 80.0
+}
+
 impl StackLayout {
     pub fn new() -> Self {
-        glib::Object::new()
+        let l: Self = glib::Object::new();
+        l.imp().zoom.set(1.0);
+        l
+    }
+    pub fn zoom(&self) -> f64 {
+        self.imp().zoom.get()
+    }
+    pub fn set_zoom(&self, v: f64) {
+        self.imp().zoom.set(v);
     }
     pub fn pos(&self) -> f64 {
         self.imp().pos.get()
