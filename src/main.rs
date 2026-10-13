@@ -506,16 +506,45 @@ impl App {
             return;
         }
         if i != self.cur.get() {
-            self.exit_overview();
+            let was_ov = self.ov.get();
+            let old = self.ws();
+            if was_ov {
+                // Overview follows you: the old workspace zooms back in as it slides away.
+                old.strip.remove_css_class("zoomed");
+                for t in old.tabs.borrow().iter() {
+                    t.view.set_can_target(true);
+                }
+                old.target.set(self.ov_saved.get());
+            }
             self.palette.set_visible(false);
             self.cur.set(i);
             self.animate_stack();
             let ws = self.ws();
             let len = ws.tabs.borrow().len();
+            if was_ov {
+                self.reveal_ws(&old);
+                if len == 0 {
+                    // Nothing to look at: leave overview and open a fresh tab.
+                    self.ov.set(false);
+                    self.ov_hint.set_visible(false);
+                    self.target_zoom.set(1.0);
+                } else {
+                    ws.strip.add_css_class("zoomed");
+                    for t in ws.tabs.borrow().iter() {
+                        t.view.set_can_target(false);
+                    }
+                    self.ov_saved.set(ws.target.get());
+                    ws.layout.set_zoom(OV_ZOOM);
+                    ws.layout.set_offset(ws.target.get());
+                }
+            }
             if len == 0 {
                 self.new_tab();
             } else {
                 self.focus_tab(ws.focus.get().min(len - 1));
+                if was_ov {
+                    self.ov_return.set(self.ws().focus.get());
+                }
             }
             self.refresh_sidebar();
         }
@@ -540,7 +569,6 @@ impl App {
             return;
         }
         let Some(view) = self.focused_view() else { return };
-        self.exit_overview();
         if i == n {
             self.add_ws(&format!("Workspace {}", i + 1));
             self.save_workspaces();
@@ -553,23 +581,14 @@ impl App {
         view.remove_css_class("focused");
         dst.strip.append(&view);
         dst.tabs.borrow_mut().push(Tab { view: view.clone() });
-        if dst.focus.get() >= dst.tabs.borrow().len() {
-            dst.focus.set(dst.tabs.borrow().len() - 1);
-        }
+        dst.focus.set(dst.tabs.borrow().len() - 1);
         if self.fresh.borrow().as_ref() == Some(&view) {
             *self.fresh.borrow_mut() = None;
         }
         let left = src.tabs.borrow().len();
-        let name = dst.name.borrow().clone();
-        src.focus.set(usize::MAX);
-        if left == 0 {
-            dst.focus.set(dst.tabs.borrow().len() - 1); // follow the tab
-            self.switch_ws(i);
-        } else {
-            self.focus_tab(idx.saturating_sub(1).min(left - 1));
-            self.toast(&format!("Moved to {} · {name}", i + 1));
-        }
-        self.refresh_sidebar();
+        src.focus.set(if left == 0 { usize::MAX } else { idx.saturating_sub(1).min(left - 1) });
+        // Always follow the moved tab, overview or not.
+        self.switch_ws(i);
     }
 
     fn close_ws(self: &Rc<Self>) {
@@ -1560,7 +1579,24 @@ impl App {
     fn on_key(self: &Rc<Self>, key: gdk::Key, code: u32, state: gdk::ModifierType) -> bool {
         use gdk::ModifierType as M;
         let m = state & gtk::accelerator_get_default_mod_mask();
-        let k = key.to_lower();
+        if std::env::var_os("RAIL_DEBUG_KEYS").is_some() {
+            eprintln!("key {:?} code {code} state {state:?}", key.name());
+        }
+        // The letter we want comes from the physical key, so layouts that remap
+        // Shift+letter (or non-Latin layouts) still hit our shortcuts.
+        let physical = match code {
+            43 => Some(gdk::Key::h),
+            44 => Some(gdk::Key::j),
+            45 => Some(gdk::Key::k),
+            46 => Some(gdk::Key::l),
+            42 => Some(gdk::Key::g),
+            40 => Some(gdk::Key::d),
+            _ => None,
+        };
+        let k = match physical {
+            Some(p) if m.intersects(M::CONTROL_MASK) => p,
+            _ => key.to_lower(),
+        };
 
         if k == gdk::Key::Escape {
             if self.palette_open() {

@@ -96,7 +96,7 @@ Workspaces are strips stacked on top of each other (like niri's). The sidebar li
 | Key | Action |
 |---|---|
 | `Ctrl+1` … `Ctrl+9` | Go to workspace N (the next free number creates it) |
-| `Ctrl+Shift+1` … `9` | Move the focused tab to workspace N |
+| `Ctrl+Shift+1` … `9` | Move the focused tab to workspace N and follow it (works in overview too) |
 | `Ctrl+Alt+J` / `Ctrl+Alt+K` | Workspace below / above |
 | `F2` | Rename the current workspace |
 | `Ctrl+Alt+W` | Close the current workspace and its tabs |
