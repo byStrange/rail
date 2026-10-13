@@ -1579,7 +1579,24 @@ impl App {
     fn on_key(self: &Rc<Self>, key: gdk::Key, code: u32, state: gdk::ModifierType) -> bool {
         use gdk::ModifierType as M;
         let m = state & gtk::accelerator_get_default_mod_mask();
-        let k = key.to_lower();
+        if std::env::var_os("RAIL_DEBUG_KEYS").is_some() {
+            eprintln!("key {:?} code {code} state {state:?}", key.name());
+        }
+        // The letter we want comes from the physical key, so layouts that remap
+        // Shift+letter (or non-Latin layouts) still hit our shortcuts.
+        let physical = match code {
+            43 => Some(gdk::Key::h),
+            44 => Some(gdk::Key::j),
+            45 => Some(gdk::Key::k),
+            46 => Some(gdk::Key::l),
+            42 => Some(gdk::Key::g),
+            40 => Some(gdk::Key::d),
+            _ => None,
+        };
+        let k = match physical {
+            Some(p) if m.intersects(M::CONTROL_MASK) => p,
+            _ => key.to_lower(),
+        };
 
         if k == gdk::Key::Escape {
             if self.palette_open() {
