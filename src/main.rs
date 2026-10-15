@@ -376,6 +376,17 @@ struct App {
     adblock_filter: RefCell<Option<webkit6::UserContentFilter>>,
 }
 
+/// A closed tab's page can keep playing after its widget is gone (the web process
+/// outlives the view), so stop the media and navigate away to tear the player down.
+fn silence(view: &WebView) {
+    let v = view.clone();
+    view.evaluate_javascript(
+        "document.querySelectorAll('video,audio').forEach(m=>{m.pause();m.removeAttribute('src');m.load()})",
+        None, None, gio::Cancellable::NONE,
+        move |_| v.load_uri("about:blank"),
+    );
+}
+
 fn data_dir() -> PathBuf {
     let dir = glib::user_data_dir().join("rail");
     let _ = std::fs::create_dir_all(&dir);
@@ -727,6 +738,9 @@ impl App {
                 *self.fresh.borrow_mut() = None;
             }
         }
+        for t in ws.tabs.borrow().iter() {
+            silence(&t.view);
+        }
         self.stack.remove(&ws.strip);
         let new = i.saturating_sub(1);
         self.cur.set(new);
@@ -999,6 +1013,7 @@ impl App {
         }
         let was_pinned = self.tab_of(view).is_some_and(|t| t.st.pinned.get());
         self.detach_view(view);
+        silence(view);
         if was_pinned {
             self.save_pinned();
         }
