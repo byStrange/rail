@@ -23,6 +23,17 @@ pub fn col_width(full: bool, viewport: f64) -> f64 {
     if full { viewport } else { ((viewport - GAP) / 2.0).floor() }
 }
 
+/// Width of one tab's column: pinned tabs are a narrow quarter, `full` ones fill the viewport.
+pub fn col_width_of(w: &impl IsA<gtk::Widget>, viewport: f64) -> f64 {
+    if w.has_css_class("full") {
+        viewport
+    } else if w.has_css_class("pinned") {
+        ((viewport - GAP) / 4.0).floor()
+    } else {
+        col_width(false, viewport)
+    }
+}
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -67,7 +78,7 @@ mod imp {
             let mut x = 0.0;
             let mut child = widget.first_child();
             while let Some(c) = child {
-                let cw = col_width(c.has_css_class("full"), vw);
+                let cw = col_width_of(&c, vw);
                 // Children keep their real size; the transform does the scaling,
                 // so pages never re-layout while zooming.
                 let t = gsk::Transform::new()

@@ -14,9 +14,13 @@ your system**, so the program itself is only ~450 KB and it ships no browser eng
 - keyboard-first (vim-style `h` / `l`), no title bar, no toolbar, nothing but the page
 - **workspaces**: stacked strips, each with its own endless row of tabs; name them, jump with `Ctrl+1`…`9`
 - **group by site**: `app.example.com`, `example.com` and `example.com/x` land together
-- address bar with history **autocomplete** (inline completion + suggestions)
+- address bar with history **autocomplete** (inline completion + suggestions) and **search shortcuts** (`gh rust`, `yt lofi`)
+- **fuzzy tab search** across every workspace, **find in page**, **pinned tabs**, per-tab **mute**
+- **vim keys inside the page** (`j k d u gg G`, `Space` = small scroll, `/` find)
+- tabs you are not looking at are **suspended automatically** and wake up when focused
+- **ad & tracker blocking**, a **right-click menu**, **screenshots** (visible area or full page) and **picture-in-picture**
 - **downloads** with a panel, progress, open / show-in-folder
-- starts fresh every time: one empty tab, no session restore (workspace names are remembered)
+- starts fresh every time: one empty tab, no session restore (workspace names and pinned tabs are remembered)
 - logins are kept between runs (cookies are stored on disk)
 
 > **Platform:** Linux only (GTK4 + WebKitGTK). Developed on Wayland (niri); X11 should work too.
@@ -89,6 +93,44 @@ Everything is on the keyboard. The page has no toolbar; the address bar appears 
 | `Ctrl+R` | Reload |
 | `Alt+Left` / `Alt+Right` | Back / forward |
 
+### Inside a page
+
+These keys are handled by the page itself, so they only work when you are **not typing in a field**.
+`<leader>` is `Space`: pressing it on its own scrolls down a little.
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Scroll down / up (smoothly) |
+| `d` / `u` | Half a page down / up |
+| `gg` / `G` | Top / bottom of the page |
+| `Space` | Small scroll down (and starts a `<leader>` sequence) |
+| `Space f w` | Fuzzy tab search (also `Ctrl+Shift+F`, which works everywhere) |
+| `/` | Find in page: type, `Enter` keeps the highlights, `Esc` clears them |
+| `n` / `N` | Next / previous match (after a search) |
+
+Lower-case searches ignore case; a capital letter makes them case-sensitive. Space is left alone
+on a page that is playing audio or video, so players keep their play / pause.
+If a site needs its own shortcuts, list its host in `~/.local/share/rail/nokeys.txt`
+(one per line, e.g. `youtube.com`) and these keys are switched off there.
+
+### Tab search
+
+`Space f w` or `Ctrl+Shift+F` lists your tabs from every workspace. Type a few letters (`tpo` finds
+“Test page one”; several words must all match), `↑` / `↓` or `Ctrl+J` / `Ctrl+K` pick, `Enter` jumps.
+
+### Pinned, muted, suspended
+
+| Key | Action |
+|---|---|
+| `Ctrl+P` | Pin / unpin the tab. Pinned tabs sit at the front as narrow columns and come back on every start (asleep, they load when you focus them) |
+| `Ctrl+M` | Mute / unmute the tab. A speaker icon in the sidebar shows which tabs make sound; click it to mute |
+
+**Suspension** is automatic. A tab that nobody has looked at for a while (20 minutes; sooner when many
+tabs are open: 10 min above 6, 5 min above 12, 2 min above 20) is unloaded and shows a placeholder;
+it keeps its title, icon, history and scroll position and wakes up when focused (hovering over it for a
+moment also wakes it). A tab is never suspended while it is focused or on screen, loading, playing sound,
+using the camera or microphone, downloading, or holding text you typed into a field.
+
 ### Workspaces
 
 Workspaces are strips stacked on top of each other (like niri's). The sidebar lists them.
@@ -108,9 +150,30 @@ Workspaces are strips stacked on top of each other (like niri's). The sidebar li
 |---|---|
 | typing | Completes inline from history (`git` → `github.com`); `Backspace` removes the suggestion |
 | `↑` / `↓` | Walk the history suggestions |
+| `gh rust`, `yt lofi`, `w rust` … | **Search shortcuts**: first word picks the site (`g` Google, `ddg`, `gh` GitHub, `yt` YouTube, `w` Wikipedia, `mdn`, `so`, `r` Reddit, `crates`, `docs` docs.rs, `npm`, `aur`, `aw` Arch wiki, `maps`, `i` images) |
 | `Ctrl+Shift+D` | Downloads panel (also the button in the sidebar) |
 
 Files go to your XDG Downloads folder (`~/Downloads` by default).
+Add your own shortcuts in `~/.local/share/rail/searchengines.txt`, one per line:
+`wiki https://en.wikipedia.org/w/index.php?search=%s`.
+
+### Right-click menu, screenshots, picture-in-picture
+
+Right-click opens Rail's own menu: back / forward / reload, link, image and text actions, and the
+page actions below.
+
+| Key | Action |
+|---|---|
+| `Ctrl+Shift+S` | Screenshot: `V` visible area or `F` full page, then `C` copy or `S` save (PNG in `~/Pictures/Screenshots`) |
+| `Ctrl+Shift+P` | Picture-in-picture: pops the tab out into a small window showing only its biggest video; `Esc` (or `Ctrl+Shift+P`) puts it back |
+| `Ctrl+Shift+A` | Ad & tracker blocking on / off (reload the page to apply) |
+
+Picture-in-picture opens a window titled “Picture in Picture”. On a tiling compositor give it a floating
+rule (niri: `window-rule { match title="^Picture in Picture$"; open-floating true }`).
+
+**Ad blocking** blocks third-party requests to a built-in list of ad and tracker hosts and hides a few
+obvious ad boxes. Add hosts (one per line) to `~/.local/share/rail/blocklist.txt`. It does not remove
+ads that are served from the site's own domain (such as YouTube's).
 
 ### Overview
 
@@ -138,8 +201,9 @@ The window has no title bar, so `Ctrl+Q` is how you close it.
 ## Where your data goes
 
 `~/.local/share/rail/` holds cookies (so you stay logged in), `history.tsv` (address
-autocomplete), `downloads.txt` (the downloads list) and `workspaces.txt` (workspace names).
-Delete the folder to reset everything. Open tabs are never restored.
+autocomplete), `downloads.txt` (the downloads list), `workspaces.txt` (workspace names) and
+`pinned.txt` (pinned tabs). Optional files you can create: `searchengines.txt`, `blocklist.txt`,
+`nokeys.txt`. Delete the folder to reset everything. Open tabs other than pinned ones are never restored.
 
 ## Troubleshooting
 
@@ -171,6 +235,12 @@ fix is a custom user agent for `accounts.google.com`.
 
 ```
 src/main.rs                    the app: workspaces, tabs, sidebar, address bar, downloads, keys
+src/nav.rs                     tab search, find in page, pin, mute, ad-block switch
+src/suspend.rs                 automatic tab suspension
+src/menu.rs, shot.rs, pip.rs   right-click menu, screenshots, picture-in-picture
+src/page.js                    the vim keys and picture-in-picture script injected into every page
+src/fuzzy.rs, search.rs        fuzzy matcher, search shortcuts
+src/blocklist.rs               ad / tracker rules
 src/history.rs                 history log, autocomplete, site (domain) grouping key
 src/strip.rs                   custom GTK layouts: scrolling strip, workspace stack, sliding sidebar
 packaging/build-appimage.sh    experimental AppImage builder (see below)
@@ -185,9 +255,10 @@ For everyday use, build from source as described above.
 
 ## Not done yet
 
-- No ad blocking, private mode, multiple profiles or password manager.
-- No find-in-page, bookmarks or full history page.
-- Tabs are never suspended, so every open tab stays in memory.
+- No private mode, multiple profiles or password manager.
+- No bookmarks or full history page.
+- Ad blocking is host-based: no cosmetic filters beyond a few ad boxes and no EasyList.
+- Screenshots capture the whole visible area or the full page, not a dragged region.
 - `Ctrl+J` / `Ctrl+K` are unused (reserved for stacked tabs in a column).
 - A failed page load shows WebKit's plain default error page.
 
