@@ -1,5 +1,13 @@
+mod blocklist;
+mod fuzzy;
 mod history;
+mod menu;
+mod nav;
+mod pip;
+mod search;
+mod shot;
 mod strip;
+mod suspend;
 
 use gtk::glib;
 use gtk::{gdk, gio};
@@ -8,8 +16,8 @@ use history::{Completion, History, domain_key};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
-use strip::{OV_ZOOM, SIDE_W, ShellLayout, StackLayout, StripLayout, col_width, gap, stack_pitch};
+use std::time::{Duration, Instant};
+use strip::{OV_ZOOM, SIDE_W, ShellLayout, StackLayout, StripLayout, col_width_of, gap, stack_pitch};
 use webkit6::prelude::*;
 use webkit6::WebView;
 
@@ -35,6 +43,10 @@ kbd{font:12px ui-monospace,monospace;background:#1f2335;border:1px solid #2f334d
 <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></span><span>group tabs by site</span>
 <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>D</kbd></span><span>downloads</span>
 <span><kbd>Ctrl</kbd><kbd>O</kbd></span><span>overview</span>
+<span><kbd>Space</kbd><kbd>f</kbd><kbd>w</kbd></span><span>jump to any tab</span>
+<span><kbd>/</kbd> <kbd>n</kbd> <kbd>N</kbd></span><span>find in page</span>
+<span><kbd>Ctrl</kbd><kbd>P</kbd></span><span>pin tab</span>
+<span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>S</kbd></span><span>screenshot</span>
 </div></div>"#;
 
 const CSS: &str = "
@@ -120,6 +132,33 @@ entry.palette-entry selection { background: rgba(122,162,247,0.35); color: #c0ca
 .sugg-title { color: #c0caf5; font-size: 14px; }
 .sugg-url { color: #565f89; font-size: 12px; }
 
+/* ---- right-click menu ---- */
+popover.ctx > contents { background: #1a1b26; border: 1px solid #2f334d; border-radius: 12px; padding: 6px;
+                         box-shadow: 0 16px 40px rgba(0,0,0,0.5); min-width: 230px; }
+button.ctx-item { background: transparent; border: none; box-shadow: none; color: #c0caf5; font-size: 13px;
+                  padding: 6px 10px; border-radius: 8px; min-height: 0; }
+button.ctx-item:hover, button.ctx-item:focus-visible { background: #24283b; outline: none; }
+button.ctx-item:focus { outline: none; }
+button.ctx-item:disabled { color: #3b4261; background: transparent; }
+.ctx-hint { color: #565f89; font-size: 11px; }
+separator.ctx-sep { background: #2a2e45; min-height: 1px; margin: 5px 4px; }
+
+/* ---- screenshot bar ---- */
+.shot { background: #1a1b26; border: 1px solid #2f334d; border-radius: 14px; padding: 8px 10px;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
+.shot-title { color: #a9b1d6; font-size: 13px; font-weight: 600; margin: 0 8px; }
+button.shot-btn { background: #24283b; border: none; box-shadow: none; color: #c0caf5; font-size: 13px;
+                  padding: 6px 12px; border-radius: 9px; min-height: 0; }
+button.shot-btn:hover { background: #2f3550; }
+picture.shot-pic { border-radius: 6px; background: #0f1016; }
+
+/* ---- tab badges in the sidebar ---- */
+.tab-pin { color: #7aa2f7; -gtk-icon-size: 12px; }
+button.tab-audio { background: transparent; border: none; box-shadow: none; color: #7982a9; padding: 0;
+                   min-width: 22px; min-height: 22px; border-radius: 6px; }
+button.tab-audio:hover { background: #2a2e45; color: #c0caf5; }
+.tabrow.asleep label { color: #565f89; }
+
 /* ---- overview (the live strip, zoomed out) ---- */
 .zoomed .tab { opacity: 0.88; border-radius: 28px; }
 .zoomed .tab.focused { opacity: 1; outline: 7px solid #3b4261; outline-offset: -5px; }
@@ -159,9 +198,80 @@ button.dl-clear:hover { background: #2a2e45; color: #c0caf5; }
 
 const MAX_WS: usize = 9;
 
+/// What a suspended tab remembers so it can come back exactly where it was.
+struct Susp {
+    uri: String,
+    title: String,
+    favicon: Option<gdk::Texture>,
+    state: Option<webkit6::WebViewSessionState>,
+    scroll: (f64, f64),
+}
+
+/// Per-tab bookkeeping that WebKit itself does not keep.
+struct TabState {
+    pinned: Cell<bool>,
+    /// The address a pinned tab is restored with on the next start.
+    pin_url: RefCell<Option<String>>,
+    /// The user typed into a field: unsaved input must never be thrown away.
+    dirty: Cell<bool>,
+    /// A find-in-page highlight is showing (Esc clears it).
+    finding: Cell<bool>,
+    /// Last time the tab was focused, visible, or making noise.
+    last_active: Cell<Instant>,
+    susp: RefCell<Option<Susp>>,
+    /// Scroll position to apply once a resumed page has loaded.
+    scroll_to: Cell<Option<(f64, f64)>>,
+    resume_gen: Cell<u32>,
+}
+
 #[derive(Clone)]
 struct Tab {
     view: WebView,
+    st: Rc<TabState>,
+}
+
+impl Tab {
+    fn new(view: WebView) -> Self {
+        Tab {
+            view,
+            st: Rc::new(TabState {
+                pinned: Cell::new(false),
+                pin_url: RefCell::new(None),
+                dirty: Cell::new(false),
+                finding: Cell::new(false),
+                last_active: Cell::new(Instant::now()),
+                susp: RefCell::new(None),
+                scroll_to: Cell::new(None),
+                resume_gen: Cell::new(0),
+            }),
+        }
+    }
+
+    fn suspended(&self) -> bool {
+        self.st.susp.borrow().is_some()
+    }
+
+    fn uri(&self) -> Option<String> {
+        match &*self.st.susp.borrow() {
+            Some(s) => Some(s.uri.clone()),
+            None => self.view.uri().map(|u| u.to_string()),
+        }
+    }
+
+    fn title(&self) -> Option<String> {
+        match &*self.st.susp.borrow() {
+            Some(s) => Some(s.title.clone()),
+            None => self.view.title().map(|t| t.to_string()),
+        }
+        .filter(|t| !t.is_empty())
+    }
+
+    fn favicon(&self) -> Option<gdk::Texture> {
+        match &*self.st.susp.borrow() {
+            Some(s) => s.favicon.clone(),
+            None => self.view.favicon(),
+        }
+    }
 }
 
 /// One workspace: a full, independent, endlessly scrolling strip of tabs.
@@ -183,6 +293,10 @@ struct Ws {
 enum Mode {
     Address,
     Rename,
+    /// Fuzzy jump to any open tab.
+    Tabs,
+    /// Find in page.
+    Find,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -250,6 +364,16 @@ struct App {
     side_gen: Cell<u32>,
     /// A just-created tab that has never navigated; Esc discards it.
     fresh: RefCell<Option<WebView>>,
+    overlay: gtk::Overlay,
+    /// Shared by every tab: carries the key script and the ad filter.
+    ucm: webkit6::UserContentManager,
+    engines: RefCell<search::Engines>,
+    /// Tab-search results: (workspace, tab) per row.
+    sugg_tabs: RefCell<Vec<(usize, usize)>>,
+    shot: RefCell<Option<shot::Shot>>,
+    pip: RefCell<Option<pip::Pip>>,
+    adblock_on: Cell<bool>,
+    adblock_filter: RefCell<Option<webkit6::UserContentFilter>>,
 }
 
 fn data_dir() -> PathBuf {
@@ -258,8 +382,11 @@ fn data_dir() -> PathBuf {
     dir
 }
 
-fn to_uri(input: &str) -> String {
+fn to_uri(input: &str, engines: &search::Engines) -> String {
     let s = input.trim();
+    if let Some(u) = search::expand(s, engines) {
+        return u;
+    }
     if s.contains("://") || s.starts_with("about:") || s.starts_with("file:") {
         return s.into();
     }
@@ -313,6 +440,12 @@ impl App {
             .map(|(i, w)| (i, w.clone()))
     }
 
+    fn focused_tab(&self) -> Option<Tab> {
+        let ws = self.ws();
+        let tabs = ws.tabs.borrow();
+        tabs.get(ws.focus.get()).cloned()
+    }
+
     fn focused_view(&self) -> Option<WebView> {
         let ws = self.ws();
         let tabs = ws.tabs.borrow();
@@ -348,7 +481,7 @@ impl App {
         let mut x = 0.0;
         let mut span = None;
         for (i, t) in tabs.iter().enumerate() {
-            let w = col_width(t.view.has_css_class("full"), vw);
+            let w = col_width_of(&t.view, vw);
             if i == ws.focus.get() {
                 span = Some((x, x + w));
             }
@@ -559,10 +692,13 @@ impl App {
         let dst = self.wss.borrow()[i].clone();
         let idx = src.focus.get();
         src.strip.remove(&view);
-        src.tabs.borrow_mut().remove(idx);
+        let tab = src.tabs.borrow_mut().remove(idx);
         view.remove_css_class("focused");
+        if tab.st.pinned.replace(false) {
+            view.remove_css_class("pinned");
+        }
         dst.strip.append(&view);
-        dst.tabs.borrow_mut().push(Tab { view: view.clone() });
+        dst.tabs.borrow_mut().push(tab);
         dst.focus.set(dst.tabs.borrow().len() - 1);
         if self.fresh.borrow().as_ref() == Some(&view) {
             *self.fresh.borrow_mut() = None;
@@ -570,6 +706,7 @@ impl App {
         let left = src.tabs.borrow().len();
         src.focus.set(if left == 0 { usize::MAX } else { idx.saturating_sub(1).min(left - 1) });
         self.reveal_ws(&src);
+        self.save_pinned();
         // Always follow the moved tab, overview or not.
         self.switch_ws(i);
     }
@@ -623,7 +760,8 @@ impl App {
             return false;
         }
         let keys: Vec<Option<String>> =
-            ws.tabs.borrow().iter().map(|t| t.view.uri().and_then(|u| domain_key(&u))).collect();
+            ws.tabs.borrow().iter().map(|t| t.uri().and_then(|u| domain_key(&u))).collect();
+        let pinned: Vec<bool> = ws.tabs.borrow().iter().map(|t| t.st.pinned.get()).collect();
         // Rank of a tab = position of the first tab of its site. Tabs without a site stand alone.
         let rank: Vec<usize> = (0..n)
             .map(|i| match &keys[i] {
@@ -632,13 +770,19 @@ impl App {
             })
             .collect();
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| (rank[i], i));
+        order.sort_by_key(|&i| (!pinned[i], rank[i], i));
         if order.iter().enumerate().all(|(a, &b)| a == b) {
             return false;
         }
-        let focused = ws.tabs.borrow().get(ws.focus.get()).map(|t| t.view.clone());
         let old = ws.tabs.borrow().clone();
         let new: Vec<Tab> = order.iter().map(|&i| old[i].clone()).collect();
+        self.set_order(ws, new);
+        true
+    }
+
+    /// Put the workspace's tabs in `new` order (same tabs), keeping the focused one focused.
+    fn set_order(self: &Rc<Self>, ws: &Rc<Ws>, new: Vec<Tab>) {
+        let focused = ws.tabs.borrow().get(ws.focus.get()).map(|t| t.view.clone());
         let mut prev: Option<&WebView> = None;
         for t in &new {
             ws.strip.reorder_child_after(&t.view, prev);
@@ -655,7 +799,6 @@ impl App {
             self.reveal_ws(ws);
             self.refresh_sidebar();
         }
-        true
     }
 
     fn toggle_group(self: &Rc<Self>) {
@@ -674,11 +817,21 @@ impl App {
 
     fn new_tab(self: &Rc<Self>) {
         self.exit_overview();
-        let view = WebView::new();
+        let view = self.new_view();
         view.load_html(START_PAGE, None);
         *self.fresh.borrow_mut() = Some(view.clone());
         self.add_view(view);
         self.show_palette();
+    }
+
+    fn new_view(&self) -> WebView {
+        let view = WebView::builder().user_content_manager(&self.ucm).build();
+        if std::env::var_os("RAIL_DEBUG_CONSOLE").is_some() {
+            if let Some(s) = webkit6::prelude::WebViewExt::settings(&view) {
+                s.set_enable_write_console_messages_to_stdout(true);
+            }
+        }
+        view
     }
 
     fn add_view(self: &Rc<Self>, view: WebView) {
@@ -689,7 +842,9 @@ impl App {
         let idx = {
             let tabs = ws.tabs.borrow();
             let f = ws.focus.get();
-            if tabs.is_empty() { 0 } else if f < tabs.len() { f + 1 } else { tabs.len() }
+            let pinned = tabs.iter().take_while(|t| t.st.pinned.get()).count();
+            let after = if tabs.is_empty() { 0 } else if f < tabs.len() { f + 1 } else { tabs.len() };
+            after.max(pinned) // never in the middle of the pinned block
         };
         {
             let tabs = ws.tabs.borrow();
@@ -698,7 +853,7 @@ impl App {
                 _ => ws.strip.insert_child_after(&view, Some(&tabs[idx - 1].view)),
             }
         }
-        ws.tabs.borrow_mut().insert(idx, Tab { view: view.clone() });
+        ws.tabs.borrow_mut().insert(idx, Tab::new(view.clone()));
 
         let app = self.clone();
         view.connect_title_notify(move |_| app.refresh_sidebar());
@@ -711,6 +866,22 @@ impl App {
             app.refresh_sidebar();
             app.update_load_bar();
         });
+        // Sound (or its mute switch) changing is both worth showing and a sign of life.
+        let (app, v) = (self.clone(), view.clone());
+        view.connect_is_playing_audio_notify(move |_| {
+            if let Some(t) = app.tab_of(&v) {
+                t.st.last_active.set(Instant::now());
+            }
+            app.refresh_sidebar();
+        });
+        let app = self.clone();
+        view.connect_is_muted_notify(move |_| app.refresh_sidebar());
+        if let Some(fc) = view.find_controller() {
+            let app = self.clone();
+            fc.connect_counted_matches(move |_, n| app.find_result(n));
+            let app = self.clone();
+            fc.connect_failed_to_find_text(move |_| app.find_result(0));
+        }
         // A crashed or killed web process leaves a dead page; bring it back.
         view.connect_web_process_terminated(|v, reason| {
             eprintln!("rail: web process terminated ({reason:?}), reloading");
@@ -720,8 +891,18 @@ impl App {
         view.connect_estimated_load_progress_notify(move |_| app.update_load_bar());
         let app = self.clone();
         view.connect_load_changed(move |v, ev| {
-            if ev != webkit6::LoadEvent::Finished {
-                return;
+            let tab = app.tab_of(v);
+            if ev == webkit6::LoadEvent::Committed {
+                if let Some(t) = &tab {
+                    t.st.dirty.set(false); // a new page has no unsaved input
+                    t.st.finding.set(false);
+                }
+            }
+            if ev != webkit6::LoadEvent::Finished || tab.as_ref().is_some_and(|t| t.suspended()) {
+                return; // a suspended tab only shows its placeholder: not a visit
+            }
+            if let Some((x, y)) = tab.as_ref().and_then(|t| t.st.scroll_to.take()) {
+                v.evaluate_javascript(&format!("window.scrollTo({x},{y})"), None, None, gio::Cancellable::NONE, |_| {});
             }
             if let Some(uri) = v.uri() {
                 app.history.borrow_mut().visit(&uri, v.title().as_deref().unwrap_or(""));
@@ -734,21 +915,102 @@ impl App {
         });
         let app = self.clone();
         view.connect_create(move |v, _| {
-            let nv = WebView::builder().related_view(v).build();
+            let nv = WebView::builder().related_view(v).user_content_manager(&app.ucm).build();
             app.add_view(nv.clone());
             Some(nv.upcast())
         });
         let app = self.clone();
         view.connect_close(move |v| app.close_view(v));
+        // Clicking a tab makes it the focused one (the page still gets the click).
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let app = self.clone();
+        let v = view.clone();
+        click.connect_pressed(move |g, _, _, _| {
+            g.set_state(gtk::EventSequenceState::None);
+            if let Some((_, ws)) = app.find_view(&v) {
+                let i = ws.tabs.borrow().iter().position(|t| t.view == v);
+                if let Some(i) = i.filter(|&i| ws.focus.get() != i) {
+                    app.focus_tab(i);
+                }
+            }
+        });
+        view.add_controller(click);
+        // Hovering a tab focuses it too (no scrolling).
+        let motion = gtk::EventControllerMotion::new();
+        let pointer = Rc::new(Cell::new((0.0, 0.0)));
+        let p = pointer.clone();
+        motion.connect_motion(move |_, x, y| p.set((x, y)));
+        let app = self.clone();
+        let v = view.clone();
+        motion.connect_enter(move |_, _, _| {
+            if app.ov.get() || app.palette_open() {
+                return;
+            }
+            let ws = app.ws();
+            let i = ws.tabs.borrow().iter().position(|t| t.view == v);
+            if let Some(i) = i.filter(|&i| ws.focus.get() != i) {
+                app.focus_tab_opts(i, false);
+            }
+        });
+        view.add_controller(motion);
+        // Our own right-click menu replaces WebKit's.
+        let app = self.clone();
+        view.connect_context_menu(move |v, _, hit| {
+            app.show_menu(v, hit, pointer.get());
+            true
+        });
+        // Own the file picker (<input type=file>) instead of relying on WebKit's default.
+        view.connect_run_file_chooser(|v, req| {
+            let dialog = gtk::FileDialog::new();
+            if let Some(f) = req.mime_types_filter() {
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&f);
+                dialog.set_filters(Some(&filters));
+            }
+            let win = v.root().and_downcast::<gtk::Window>();
+            let multiple = req.selects_multiple();
+            let req = req.clone();
+            let done = move |res: Result<Vec<gio::File>, gtk::glib::Error>| match res {
+                Ok(files) => {
+                    let paths: Vec<String> = files.iter().filter_map(|f| f.path()).map(|p| p.to_string_lossy().into_owned()).collect();
+                    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                    req.select_files(&refs);
+                }
+                Err(_) => req.cancel(),
+            };
+            if multiple {
+                dialog.open_multiple(win.as_ref(), gio::Cancellable::NONE, move |r| {
+                    done(r.map(|l| l.iter::<gio::File>().flatten().collect()))
+                });
+            } else {
+                dialog.open(win.as_ref(), gio::Cancellable::NONE, move |r| done(r.map(|f| vec![f])));
+            }
+            true
+        });
 
         self.focus_tab(idx);
     }
 
     fn close_view(self: &Rc<Self>, view: &WebView) {
-        let Some((wi, ws)) = self.find_view(view) else { return };
-        let Some(idx) = ws.tabs.borrow().iter().position(|t| &t.view == view) else { return };
+        if self.pip.borrow().as_ref().is_some_and(|p| &p.tab.view == view) {
+            self.pip_discard(); // the page closed itself while popped out
+            return;
+        }
+        let was_pinned = self.tab_of(view).is_some_and(|t| t.st.pinned.get());
+        self.detach_view(view);
+        if was_pinned {
+            self.save_pinned();
+        }
+    }
+
+    /// Take a tab out of its strip (without closing the page) and fix up focus.
+    /// Returns (workspace index, tab index, the tab).
+    fn detach_view(self: &Rc<Self>, view: &WebView) -> Option<(usize, usize, Tab)> {
+        let (wi, ws) = self.find_view(view)?;
+        let idx = ws.tabs.borrow().iter().position(|t| &t.view == view)?;
         ws.strip.remove(view);
-        ws.tabs.borrow_mut().remove(idx);
+        let tab = ws.tabs.borrow_mut().remove(idx);
         if self.fresh.borrow().as_ref() == Some(view) {
             *self.fresh.borrow_mut() = None;
         }
@@ -757,7 +1019,7 @@ impl App {
             let f = ws.focus.get();
             ws.focus.set(if len == 0 { usize::MAX } else if f > idx { f - 1 } else { f.min(len - 1) });
             self.refresh_sidebar();
-            return;
+            return Some((wi, idx, tab));
         }
         ws.focus.set(usize::MAX);
         if len == 0 {
@@ -765,9 +1027,19 @@ impl App {
         } else {
             self.focus_tab(idx.saturating_sub(1).min(len - 1));
         }
+        Some((wi, idx, tab))
+    }
+
+    fn tab_of(&self, view: &WebView) -> Option<Tab> {
+        self.wss.borrow().iter().find_map(|w| w.tabs.borrow().iter().find(|t| &t.view == view).cloned())
     }
 
     fn focus_tab(self: &Rc<Self>, idx: usize) {
+        self.focus_tab_opts(idx, true);
+    }
+
+    /// `reveal` scrolls the tab into view; hover-focus skips it so the strip doesn't slide under the pointer.
+    fn focus_tab_opts(self: &Rc<Self>, idx: usize, reveal: bool) {
         let ws = self.ws();
         if idx >= ws.tabs.borrow().len() {
             return;
@@ -780,11 +1052,18 @@ impl App {
                 t.view.remove_css_class("focused");
             }
         }
-        if !ws.tabs.borrow()[idx].view.is_loading() {
+        let tab = ws.tabs.borrow()[idx].clone();
+        tab.st.last_active.set(Instant::now());
+        if tab.suspended() {
+            self.schedule_resume(&tab, if reveal { 120 } else { 700 });
+        }
+        if !tab.view.is_loading() {
             self.load_bar.set_visible(false);
         }
         self.update_load_bar();
-        self.reveal_focus();
+        if reveal {
+            self.reveal_focus();
+        }
         self.refresh_sidebar();
         if !self.palette_open() && !self.ov.get() {
             ws.tabs.borrow()[idx].view.grab_focus();
@@ -795,6 +1074,10 @@ impl App {
         let ws = self.ws();
         let i = ws.focus.get();
         let Some(j) = i.checked_add_signed(dir).filter(|&j| j < ws.tabs.borrow().len()) else { return };
+        // The pinned block stays in front: tabs move within their own side of it.
+        if ws.tabs.borrow()[i].st.pinned.get() != ws.tabs.borrow()[j].st.pinned.get() {
+            return;
+        }
         ws.tabs.borrow_mut().swap(i, j);
         let tabs = ws.tabs.borrow();
         let mut prev: Option<&WebView> = None;
@@ -823,24 +1106,23 @@ impl App {
     // ---- sidebar ---------------------------------------------------------
 
     fn tab_label(t: &Tab) -> String {
-        match t.view.title().filter(|s| !s.is_empty()) {
-            Some(s) => s.to_string(),
+        match t.title() {
+            Some(s) => s,
             None => t
-                .view
                 .uri()
                 .filter(|u| !u.starts_with("about:"))
-                .map_or("New tab".into(), |u| host_of(&u).unwrap_or(u.to_string())),
+                .map_or("New tab".into(), |u| host_of(&u).unwrap_or(u)),
         }
     }
 
     fn tab_icon(t: &Tab, size: i32) -> gtk::Widget {
-        if t.view.is_loading() {
+        if t.view.is_loading() && !t.suspended() {
             let s = gtk::Spinner::new();
             s.set_size_request(size, size);
             s.start();
             return s.upcast();
         }
-        if let Some(f) = t.view.favicon() {
+        if let Some(f) = t.favicon() {
             let img = gtk::Image::from_paintable(Some(&f));
             img.set_pixel_size(size);
             return img.upcast();
@@ -865,7 +1147,7 @@ impl App {
         }
         let mut map: Vec<Option<usize>> = Vec::new();
         let tabs = ws.tabs.borrow();
-        let keys: Vec<Option<String>> = tabs.iter().map(|t| t.view.uri().and_then(|u| domain_key(&u))).collect();
+        let keys: Vec<Option<String>> = tabs.iter().map(|t| t.uri().and_then(|u| domain_key(&u))).collect();
         let mut i = 0;
         while i < tabs.len() {
             let mut j = i + 1;
@@ -895,6 +1177,9 @@ impl App {
                 if group.is_some() {
                     row.add_css_class("in-group");
                 }
+                if t.suspended() {
+                    row.add_css_class("asleep");
+                }
                 row.append(&Self::tab_icon(t, 16));
                 let label = gtk::Label::new(Some(&Self::tab_label(t)));
                 label.set_xalign(0.0);
@@ -902,6 +1187,21 @@ impl App {
                 label.set_width_chars(1);
                 label.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 row.append(&label);
+                if t.st.pinned.get() {
+                    let pin = gtk::Image::from_icon_name("view-pin-symbolic");
+                    pin.add_css_class("tab-pin");
+                    row.append(&pin);
+                }
+                if t.view.is_muted() || t.view.is_playing_audio() {
+                    let icon = if t.view.is_muted() { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" };
+                    let snd = gtk::Button::from_icon_name(icon);
+                    snd.add_css_class("tab-audio");
+                    snd.set_valign(gtk::Align::Center);
+                    snd.set_tooltip_text(Some("Mute / unmute tab  (Ctrl+M)"));
+                    let v = t.view.clone();
+                    snd.connect_clicked(move |_| v.set_is_muted(!v.is_muted()));
+                    row.append(&snd);
+                }
                 let close = gtk::Button::from_icon_name("window-close-symbolic");
                 close.add_css_class("tab-close");
                 close.set_valign(gtk::Align::Center);
@@ -919,8 +1219,8 @@ impl App {
         if let Some(row) = sel.and_then(|p| self.list.row_at_index(p as i32)) {
             self.list.select_row(Some(&row));
         }
-        let text = match self.focused_view().and_then(|v| v.uri()) {
-            Some(u) if !u.starts_with("about:") => host_of(&u).unwrap_or(u.to_string()),
+        let text = match self.focused_tab().and_then(|t| t.uri()) {
+            Some(u) if !u.starts_with("about:") => host_of(&u).unwrap_or(u),
             _ => "Search or enter address".into(),
         };
         self.pill_label.set_text(&text);
@@ -1046,10 +1346,16 @@ impl App {
         self.mode.set(mode);
         let text = match mode {
             Mode::Address => self
-                .focused_view()
-                .and_then(|v| v.uri())
+                .focused_tab()
+                .and_then(|t| t.uri())
                 .filter(|u| !u.starts_with("about:"))
-                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            Mode::Tabs => String::new(),
+            Mode::Find => self
+                .focused_view()
+                .and_then(|v| v.find_controller())
+                .and_then(|f| f.search_text())
+                .map(|t| t.to_string())
                 .unwrap_or_default(),
             Mode::Rename => self.ws().name.borrow().clone(),
         };
@@ -1072,6 +1378,19 @@ impl App {
                 self.palette_hint.set_text("Enter  save      Esc  cancel");
                 self.update_suggestions("\0");
             }
+            Mode::Tabs => {
+                self.entry.set_placeholder_text(Some("Jump to tab"));
+                self.palette_icon.set_icon_name(Some("view-list-symbolic"));
+                self.palette_hint.set_text("Enter  jump      ↑ ↓  select      Esc  cancel");
+                self.update_suggestions("\0");
+                self.update_tab_results("");
+            }
+            Mode::Find => {
+                self.entry.set_placeholder_text(Some("Find in page"));
+                self.palette_icon.set_icon_name(Some("edit-find-symbolic"));
+                self.palette_hint.set_text("Enter  keep      ↑ ↓  next / previous      Esc  clear");
+                self.update_suggestions("\0");
+            }
         }
         self.palette.set_visible(true);
         self.entry.grab_focus();
@@ -1089,9 +1408,13 @@ impl App {
 
     /// Esc on the palette: close it, and also drop a tab that was never used.
     fn cancel_palette(self: &Rc<Self>) {
-        let rename = self.mode.get() == Mode::Rename;
+        let mode = self.mode.get();
+        let rename = mode != Mode::Address;
         let view = self.focused_view();
         let fresh = self.fresh.borrow().clone();
+        if mode == Mode::Find {
+            self.clear_find();
+        }
         self.hide_palette();
         if rename {
             return;
@@ -1109,6 +1432,7 @@ impl App {
             self.sugg.remove(&r);
         }
         self.sugg_urls.borrow_mut().clear();
+        self.sugg_tabs.borrow_mut().clear();
         self.sugg_sel.set(None);
         self.sugg.set_visible(false);
     }
@@ -1118,7 +1442,14 @@ impl App {
         self.clear_suggestions();
         if self.mode.get() != Mode::Address || text == "\0" {
             self.typed.borrow_mut().clear();
+            if self.mode.get() == Mode::Address {
+                self.palette_hint.set_text("Enter  go      ↑ ↓  history      Esc  cancel");
+            }
             return;
+        }
+        self.palette_hint.set_text("Enter  go      ↑ ↓  history      Esc  cancel");
+        if let Some(u) = search::expand(text, &self.engines.borrow()) {
+            self.palette_hint.set_text(&format!("Enter  search {}      Esc  cancel", host_of(&u).unwrap_or(u)));
         }
         *self.typed.borrow_mut() = text.to_string();
         let h = self.history.borrow();
@@ -1132,11 +1463,13 @@ impl App {
             t.set_xalign(0.0);
             t.set_ellipsize(gtk::pango::EllipsizeMode::End);
             t.set_width_chars(1);
+            t.set_max_width_chars(1);
             let u = gtk::Label::new(Some(history::strip(&e.url)));
             u.add_css_class("sugg-url");
             u.set_xalign(0.0);
             u.set_ellipsize(gtk::pango::EllipsizeMode::End);
             u.set_width_chars(1);
+            u.set_max_width_chars(1);
             row.append(&t);
             row.append(&u);
             self.sugg.append(&row);
@@ -1180,8 +1513,22 @@ impl App {
 
     /// The entry text changed by typing: refresh suggestions and complete inline.
     fn on_typed(self: &Rc<Self>) {
-        if self.suppress.get() || self.mode.get() != Mode::Address {
+        if self.suppress.get() {
             return;
+        }
+        match self.mode.get() {
+            Mode::Address => {}
+            Mode::Tabs => {
+                let q = self.entry.text().to_string();
+                self.update_tab_results(&q);
+                return;
+            }
+            Mode::Find => {
+                let q = self.entry.text().to_string();
+                self.find_text(&q);
+                return;
+            }
+            Mode::Rename => return,
         }
         let text = self.entry.text().to_string();
         let grew = text.len() > self.last_len.replace(text.len());
@@ -1209,6 +1556,22 @@ impl App {
 
     fn accept(self: &Rc<Self>) {
         let text = self.entry.text().to_string();
+        match self.mode.get() {
+            Mode::Tabs => {
+                let pick = self.sugg_sel.get().unwrap_or(0);
+                let hit = self.sugg_tabs.borrow().get(pick).copied();
+                self.hide_palette();
+                if let Some((wi, ti)) = hit {
+                    self.jump_to(wi, ti);
+                }
+                return;
+            }
+            Mode::Find => {
+                self.hide_palette();
+                return;
+            }
+            _ => {}
+        }
         if self.mode.get() == Mode::Rename {
             let name = text.trim();
             if !name.is_empty() {
@@ -1227,7 +1590,7 @@ impl App {
     fn navigate(self: &Rc<Self>, text: &str) {
         if !text.trim().is_empty() {
             if let Some(v) = self.focused_view() {
-                let uri = to_uri(text);
+                let uri = to_uri(text, &self.engines.borrow());
                 self.pill_label.set_text(&host_of(&uri).unwrap_or(uri.clone()));
                 v.load_uri(&uri);
                 *self.fresh.borrow_mut() = None;
@@ -1542,7 +1905,7 @@ impl App {
             let mut hit = None;
             let mut cx = 0.0;
             for (i, t) in ws.tabs.borrow().iter().enumerate() {
-                let w = col_width(t.view.has_css_class("full"), vw);
+                let w = col_width_of(&t.view, vw);
                 let left = (cx - off) * z;
                 if x >= left && x <= left + w * z {
                     hit = Some(i);
@@ -1604,7 +1967,7 @@ impl App {
         use gdk::ModifierType as M;
         let m = state & gtk::accelerator_get_default_mod_mask();
         if std::env::var_os("RAIL_DEBUG_KEYS").is_some() {
-            eprintln!("key {:?} code {code} state {state:?}", key.name());
+            eprintln!("key {:?} code {code} state {state:?} focus {:?}", key.name(), gtk::prelude::GtkWindowExt::focus(&self.win).map(|w| w.type_().name()));
         }
         // The letter we want comes from the physical key, so layouts that remap
         // Shift+letter (or non-Latin layouts) still hit our shortcuts.
@@ -1615,6 +1978,11 @@ impl App {
             46 => Some(gdk::Key::l),
             42 => Some(gdk::Key::g),
             40 => Some(gdk::Key::d),
+            33 => Some(gdk::Key::p),
+            41 => Some(gdk::Key::f),
+            58 => Some(gdk::Key::m),
+            39 => Some(gdk::Key::s),
+            38 => Some(gdk::Key::a),
             _ => None,
         };
         let k = match physical {
@@ -1627,6 +1995,10 @@ impl App {
                 self.cancel_palette();
                 return true;
             }
+            if self.shot.borrow().is_some() {
+                self.close_shot();
+                return true;
+            }
             if self.downloads_open() {
                 self.toggle_downloads();
                 return true;
@@ -1635,11 +2007,34 @@ impl App {
                 self.cancel_overview();
                 return true;
             }
+            // A find-in-page highlight goes first; the page only sees Esc once it is gone.
+            if self.focused_tab().is_some_and(|t| t.st.finding.get()) {
+                self.clear_find();
+                return true;
+            }
             return false;
         }
-        if self.palette_open() && m.is_empty() && matches!(k, gdk::Key::Down | gdk::Key::Up) {
-            self.sugg_move(if k == gdk::Key::Down { 1 } else { -1 });
+        if self.shot_key(k, m) {
             return true;
+        }
+        if self.palette_open() {
+            let mode = self.mode.get();
+            let ctrl = m == M::CONTROL_MASK && mode == Mode::Tabs;
+            let dir = match k {
+                gdk::Key::Down if m.is_empty() => Some(1),
+                gdk::Key::Up if m.is_empty() => Some(-1),
+                gdk::Key::n | gdk::Key::j if ctrl => Some(1),
+                gdk::Key::p | gdk::Key::k if ctrl => Some(-1),
+                _ => None,
+            };
+            if let Some(d) = dir {
+                match mode {
+                    Mode::Tabs => self.tabs_move(d),
+                    Mode::Find => self.find_step(d),
+                    _ => self.sugg_move(d),
+                }
+                return true;
+            }
         }
         // Digit keys by physical position (evdev code + 8), so any layout works.
         let digit = (10..=18).contains(&code).then(|| (code - 10) as usize);
@@ -1713,12 +2108,21 @@ impl App {
                     }
                 }
                 gdk::Key::q => self.win.close(),
+                gdk::Key::p if !self.palette_open() => self.toggle_pin(),
+                gdk::Key::m if !self.palette_open() => self.toggle_mute(),
                 _ => return false,
             }
             return true;
         }
         if m == M::CONTROL_MASK | M::SHIFT_MASK {
             match k {
+                gdk::Key::f if !self.palette_open() => {
+                    self.exit_overview();
+                    self.open_palette(Mode::Tabs);
+                }
+                gdk::Key::p if !self.palette_open() => self.toggle_pip(),
+                gdk::Key::s if !self.palette_open() => self.toggle_shot(),
+                gdk::Key::a => self.toggle_adblock(),
                 gdk::Key::h => self.move_tab(-1),
                 gdk::Key::l => self.move_tab(1),
                 gdk::Key::g => self.toggle_group(),
@@ -1944,6 +2348,24 @@ fn build(gapp: &gtk::Application) {
         .build();
 
     let dir = data_dir();
+    // Vim-style keys live in the page itself (see page.js); `nokeys.txt` lists hosts to leave alone.
+    let off: Vec<String> = std::fs::read_to_string(dir.join("nokeys.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| format!("{:?}", l.trim_start_matches("www.")))
+        .collect();
+    let ucm = webkit6::UserContentManager::new();
+    ucm.register_script_message_handler("rail", Some("rail"));
+    ucm.add_script(&webkit6::UserScript::for_world(
+        &include_str!("page.js").replace("/*OFF*/[]", &format!("[{}]", off.join(","))),
+        webkit6::UserContentInjectedFrames::TopFrame,
+        webkit6::UserScriptInjectionTime::Start,
+        "rail",
+        &[],
+        &[],
+    ));
     let downloads: Vec<Rc<Dl>> = std::fs::read_to_string(dir.join("downloads.txt"))
         .unwrap_or_default()
         .lines()
@@ -2005,8 +2427,19 @@ fn build(gapp: &gtk::Application) {
         side_open: Cell::new(true),
         side_gen: Cell::new(0),
         fresh: RefCell::new(None),
+        overlay: overlay.clone(),
+        ucm: ucm.clone(),
+        engines: RefCell::new(search::load(&dir.join("searchengines.txt"))),
+        sugg_tabs: RefCell::new(Vec::new()),
+        shot: RefCell::new(None),
+        pip: RefCell::new(None),
+        adblock_on: Cell::new(!dir.join("adblock-off").exists()),
+        adblock_filter: RefCell::new(None),
     });
     setup_storage(&app);
+    let a = app.clone();
+    ucm.connect_script_message_received(Some("rail"), move |_, v| a.on_page_msg(&v.to_str()));
+    app.setup_adblock();
 
     // Workspace names are remembered; the tabs in them are not.
     let names: Vec<String> = std::fs::read_to_string(dir.join("workspaces.txt"))
@@ -2047,6 +2480,14 @@ fn build(gapp: &gtk::Application) {
     entry.connect_changed(move |_| a.on_typed());
     let a = app.clone();
     sugg.connect_row_activated(move |_, row| {
+        if a.mode.get() == Mode::Tabs {
+            let hit = a.sugg_tabs.borrow().get(row.index() as usize).copied();
+            a.hide_palette();
+            if let Some((wi, ti)) = hit {
+                a.jump_to(wi, ti);
+            }
+            return;
+        }
         let url = a.sugg_urls.borrow().get(row.index() as usize).cloned();
         if let Some(u) = url {
             a.navigate(&u);
@@ -2083,13 +2524,26 @@ fn build(gapp: &gtk::Application) {
     });
     win.add_controller(keys);
 
-    // Fresh every launch: one empty tab, no session restore.
+    // Fresh every launch: one empty tab, no session restore -- except pinned tabs.
     app.refresh_downloads();
+    app.restore_pinned();
     app.new_tab();
+    let a = app.clone();
+    let every = std::env::var("RAIL_SWEEP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    glib::timeout_add_seconds_local(every, move || {
+        a.suspend_sweep();
+        glib::ControlFlow::Continue
+    });
     if let Some(url) = std::env::args().nth(1) {
         app.navigate(&url);
     }
     win.present();
+    // Without this a page opened from the command line starts without keyboard focus.
+    if !app.palette_open() {
+        if let Some(v) = app.focused_view() {
+            v.grab_focus();
+        }
+    }
 }
 
 /// Rail is launched without a terminal, so a panic (which aborts inside GTK
