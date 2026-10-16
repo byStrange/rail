@@ -268,3 +268,22 @@ For everyday use, build from source as described above.
 Issues and pull requests are welcome. Before sending a change, run `cargo build --release`
 and try it for real. Most of the interesting behaviour (scrolling, zoom, key handling)
 is visual and only shows up when the app is actually running.
+
+## Encrypted sync
+
+Carry your history, workspace names and pinned tabs between machines through any git remote
+(GitHub, Codeberg, your own server). It works like `gopass`: set it up once, then run `rail sync`.
+
+```sh
+rail sync init git@github.com:you/rail-data.git   # a private, empty repo; asks for a passphrase
+rail sync                                         # pull, merge, push
+rail sync status | path | git <args...>           # the repo is a plain clone you can manage yourself
+```
+
+- the repo lives in `~/.local/share/rail/sync` and holds only one encrypted file per device
+  (`<device>.rail`, an [age](https://age-encryption.org) file: `age -d` opens it without rail)
+- the passphrase is never stored by rail: it is asked for, taken from `$RAIL_SYNC_PASSPHRASE`, or
+  (with `init --remember`) kept in the desktop keyring via `secret-tool`. **If you lose it, the data is gone.**
+- history from all devices is merged as a union; other files take the most recently edited copy
+- cookies, logins and downloads are never synced
+- run it while rail is closed (or restart rail afterwards) so the running browser does not hold stale history

@@ -8,14 +8,12 @@
 //!
 //! Merging is done on plaintext after decryption: history is a union of visits,
 //! everything else is last-writer-wins by the bundle's timestamp.
-// Not wired to the UI yet.
-#![allow(dead_code)]
 
 use age::secrecy::SecretString;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 /// The files in the data directory that sync carries. Order is irrelevant.
 pub const SYNCED: &[&str] = &["history.tsv", "workspaces.txt", "pinned.txt", "nokeys.txt"];
@@ -59,30 +57,43 @@ pub struct Bundle {
     pub files: BTreeMap<String, String>,
 }
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 impl Bundle {
     /// Read the synced files out of the data directory (missing ones are skipped).
+    /// The stamp is when the user last edited anything but history (which merges as a
+    /// union and needs no stamp): the newest file modification time.
     pub fn collect(dir: &Path) -> Bundle {
         let mut files = BTreeMap::new();
+        let mut stamp = 0;
         for name in SYNCED {
-            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
-                files.insert((*name).to_string(), text);
+            let path = dir.join(name);
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            files.insert((*name).to_string(), text);
+            if *name != HISTORY {
+                let m = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let secs = m.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                stamp = stamp.max(secs);
             }
         }
-        Bundle { stamp: now(), files }
+        Bundle { stamp, files }
     }
 
-    /// Write the bundle's files into the data directory.
+    /// Write the bundle's files into the data directory. Files that already match
+    /// are left alone; the rest get the bundle's stamp as their modification time,
+    /// so applying someone else's edit does not make it look like a fresh local one.
     pub fn apply(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for (name, text) in &self.files {
             // Never trust names that came out of a file: only our own list is written.
-            if SYNCED.contains(&name.as_str()) {
-                std::fs::write(dir.join(name), text)?;
+            if !SYNCED.contains(&name.as_str()) || std::fs::read_to_string(dir.join(name)).is_ok_and(|t| t == *text) {
+                continue;
             }
+            let tmp = dir.join(format!("{name}.tmp"));
+            std::fs::write(&tmp, text)?;
+            if self.stamp > 0 {
+                let f = std::fs::File::options().write(true).open(&tmp)?;
+                f.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(self.stamp))?;
+            }
+            std::fs::rename(&tmp, dir.join(name))?;
         }
         Ok(())
     }
@@ -269,6 +280,7 @@ mod tests {
         sample().apply(&dir).unwrap();
         let got = Bundle::collect(&dir);
         assert_eq!(got.files, sample().files);
+        assert_eq!(got.stamp, 1000); // the stamp survives a trip through the disk
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

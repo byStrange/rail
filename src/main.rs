@@ -1,5 +1,6 @@
 mod blocklist;
 mod fuzzy;
+mod gitsync;
 mod history;
 mod menu;
 mod nav;
@@ -2610,6 +2611,11 @@ fn install_crash_log() {
 }
 
 fn main() -> glib::ExitCode {
+    // `rail sync ...` is a command-line tool: no window, no GTK.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "sync") {
+        return glib::ExitCode::from(gitsync::cli(&args[1..]) as u8);
+    }
     install_crash_log();
     let app = gtk::Application::builder()
         .application_id("dev.rail.browser")
