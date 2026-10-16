@@ -35,6 +35,30 @@ fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
 }
 
+/// "5m ago", "3h ago", "2d ago", and a plain date once it is over a month old.
+pub fn ago(t: u64) -> String {
+    let secs = now().saturating_sub(t);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
+        _ => {
+            // days since 1970-01-01 -> civil date (Howard Hinnant's algorithm)
+            let z = (t / 86_400) as i64 + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z.rem_euclid(146_097);
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = yoe + era * 400 + i64::from(m <= 2);
+            format!("{y}-{m:02}-{d:02}")
+        }
+    }
+}
+
 /// `https://www.github.com/a/b` -> `github.com/a/b`
 pub fn strip(url: &str) -> &str {
     let s = url.split_once("://").map_or(url, |x| x.1);
@@ -107,6 +131,34 @@ impl History {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.file) {
             let _ = writeln!(f, "{t}\t{url}\t{title}");
         }
+    }
+
+    /// Everything you can browse: matches for `query` (fuzzy, every word must hit),
+    /// or simply the most recent pages when the query is empty.
+    pub fn search(&self, query: &str, n: usize) -> Vec<&Entry> {
+        let q = query.trim();
+        let mut hits: Vec<(i32, &Entry)> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let s = if q.is_empty() { 0 } else { crate::fuzzy::score(q, &e.title, strip(&e.url))? };
+                Some((s, e))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.last.cmp(&a.1.last)));
+        hits.into_iter().take(n).map(|x| x.1).collect()
+    }
+
+    /// Forget a page: drop it from memory and from `history.tsv`.
+    pub fn remove(&mut self, url: &str) {
+        self.entries.retain(|e| e.url != url);
+        let text = std::fs::read_to_string(&self.file).unwrap_or_default();
+        let kept: Vec<&str> = text.lines().filter(|l| l.split('\t').nth(1) != Some(url)).collect();
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let _ = std::fs::write(&self.file, out);
     }
 
     /// Frequent and recent beats merely old: visits count, but fade with age.
@@ -200,5 +252,34 @@ impl History {
             .max_by(|a, b| Self::score(a, t).total_cmp(&Self::score(b, t)))?;
         let tail = strip(&best.url).get(q.len()..)?;
         Some(Completion { shown: format!("{typed}{tail}"), target: best.url.clone() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rail-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn search_and_forget() {
+        let file = temp("hist.tsv");
+        std::fs::write(&file, "100\thttps://a.com/\tAlpha\n200\thttps://b.com/\tBeta\n300\thttps://a.com/\tAlpha\n").unwrap();
+        let mut h = History::load(file.clone());
+        let urls = |h: &History, q: &str| h.search(q, 10).iter().map(|e| e.url.clone()).collect::<Vec<_>>();
+        assert_eq!(urls(&h, ""), ["https://a.com/", "https://b.com/"]); // newest first
+        assert_eq!(urls(&h, "beta"), ["https://b.com/"]);
+        h.remove("https://a.com/");
+        assert_eq!(urls(&h, ""), ["https://b.com/"]);
+        assert_eq!(History::load(file.clone()).search("", 10).len(), 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(ago(now()), "just now");
+        assert_eq!(ago(1_000_000_000), "2001-09-09");
     }
 }

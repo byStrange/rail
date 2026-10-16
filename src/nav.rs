@@ -88,7 +88,10 @@ impl App {
 
     /// ↑ / ↓ in the tab list: wraps around, never touches the typed text.
     pub(crate) fn tabs_move(&self, dir: isize) {
-        let n = self.sugg_tabs.borrow().len() as isize;
+        let n = match self.mode.get() {
+            Mode::History => self.sugg_urls.borrow().len(),
+            _ => self.sugg_tabs.borrow().len(),
+        } as isize;
         if n == 0 {
             return;
         }
@@ -96,6 +99,58 @@ impl App {
         self.sugg_sel.set(Some(next));
         if let Some(r) = self.sugg.row_at_index(next as i32) {
             self.sugg.select_row(Some(&r));
+        }
+    }
+
+    // ---- history browser ---------------------------------------------------
+
+    /// Fill the palette list with history matching `query` (newest first when empty).
+    pub(crate) fn update_history_results(&self, query: &str) {
+        self.clear_suggestions();
+        let h = self.history.borrow();
+        let mut urls = self.sugg_urls.borrow_mut();
+        for e in h.search(query, 10) {
+            let title = if e.title.is_empty() { history::strip(&e.url).to_string() } else { e.title.clone() };
+            let visits = if e.visits == 1 { "1 visit".to_string() } else { format!("{} visits", e.visits) };
+            let sub = format!("{}  ·  {}  ·  {visits}", history::strip(&e.url), history::ago(e.last));
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            row.add_css_class("sugg-row");
+            for (text, class) in [(title, "sugg-title"), (sub, "sugg-url")] {
+                let l = gtk::Label::new(Some(&text));
+                l.add_css_class(class);
+                l.set_xalign(0.0);
+                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                l.set_width_chars(1);
+                l.set_max_width_chars(1);
+                row.append(&l);
+            }
+            self.sugg.append(&row);
+            urls.push(e.url.clone());
+        }
+        if urls.is_empty() {
+            return;
+        }
+        self.sugg.set_visible(true);
+        self.sugg_sel.set(Some(0));
+        if let Some(r) = self.sugg.row_at_index(0) {
+            self.sugg.select_row(Some(&r));
+        }
+    }
+
+    /// Shift+Delete: drop the selected page from history, keep the cursor where it was.
+    pub(crate) fn forget_selected(&self) {
+        let at = self.sugg_sel.get().unwrap_or(0);
+        let Some(url) = self.sugg_urls.borrow().get(at).cloned() else { return };
+        self.history.borrow_mut().remove(&url);
+        let q = self.entry.text().to_string();
+        self.update_history_results(&q);
+        let n = self.sugg_urls.borrow().len();
+        if n > 0 {
+            let at = at.min(n - 1);
+            self.sugg_sel.set(Some(at));
+            if let Some(r) = self.sugg.row_at_index(at as i32) {
+                self.sugg.select_row(Some(&r));
+            }
         }
     }
 
