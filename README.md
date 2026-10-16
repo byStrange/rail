@@ -15,6 +15,7 @@ your system**, so the program itself is only ~450 KB and it ships no browser eng
 - **workspaces**: stacked strips, each with its own endless row of tabs; name them, jump with `Ctrl+1`…`9`
 - **group by site**: `app.example.com`, `example.com` and `example.com/x` land together
 - address bar with history **autocomplete** (inline completion + suggestions) and **search shortcuts** (`gh rust`, `yt lofi`)
+- **history browser** (`Ctrl+Y`): search everything you visited, `Shift+Del` forgets a page
 - **fuzzy tab search** across every workspace, **find in page**, **pinned tabs**, per-tab **mute**
 - **vim keys inside the page** (`j k d u gg G`, `Space` = small scroll, `/` find)
 - tabs you are not looking at are **suspended automatically** and wake up when focused

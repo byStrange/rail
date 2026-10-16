@@ -8,6 +8,7 @@ mod search;
 mod shot;
 mod strip;
 mod suspend;
+mod sync;
 
 use gtk::glib;
 use gtk::{gdk, gio};
@@ -42,6 +43,7 @@ kbd{font:12px ui-monospace,monospace;background:#1f2335;border:1px solid #2f334d
 <span><kbd>F2</kbd></span><span>name this workspace</span>
 <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>G</kbd></span><span>group tabs by site</span>
 <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>D</kbd></span><span>downloads</span>
+<span><kbd>Ctrl</kbd><kbd>Y</kbd></span><span>history</span>
 <span><kbd>Ctrl</kbd><kbd>O</kbd></span><span>overview</span>
 <span><kbd>Space</kbd><kbd>f</kbd><kbd>w</kbd></span><span>jump to any tab</span>
 <span><kbd>/</kbd> <kbd>n</kbd> <kbd>N</kbd></span><span>find in page</span>
@@ -297,6 +299,8 @@ enum Mode {
     Tabs,
     /// Find in page.
     Find,
+    /// Browse and search the whole history.
+    History,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1365,7 +1369,7 @@ impl App {
                 .and_then(|t| t.uri())
                 .filter(|u| !u.starts_with("about:"))
                 .unwrap_or_default(),
-            Mode::Tabs => String::new(),
+            Mode::Tabs | Mode::History => String::new(),
             Mode::Find => self
                 .focused_view()
                 .and_then(|v| v.find_controller())
@@ -1399,6 +1403,13 @@ impl App {
                 self.palette_hint.set_text("Enter  jump      ↑ ↓  select      Esc  cancel");
                 self.update_suggestions("\0");
                 self.update_tab_results("");
+            }
+            Mode::History => {
+                self.entry.set_placeholder_text(Some("Search history"));
+                self.palette_icon.set_icon_name(Some("document-open-recent-symbolic"));
+                self.palette_hint.set_text("Enter  open      ↑ ↓  select      Shift+Del  forget      Esc  cancel");
+                self.update_suggestions("\0");
+                self.update_history_results("");
             }
             Mode::Find => {
                 self.entry.set_placeholder_text(Some("Find in page"));
@@ -1538,6 +1549,11 @@ impl App {
                 self.update_tab_results(&q);
                 return;
             }
+            Mode::History => {
+                let q = self.entry.text().to_string();
+                self.update_history_results(&q);
+                return;
+            }
             Mode::Find => {
                 let q = self.entry.text().to_string();
                 self.find_text(&q);
@@ -1578,6 +1594,14 @@ impl App {
                 self.hide_palette();
                 if let Some((wi, ti)) = hit {
                     self.jump_to(wi, ti);
+                }
+                return;
+            }
+            Mode::History => {
+                let url = self.sugg_urls.borrow().get(self.sugg_sel.get().unwrap_or(0)).cloned();
+                match url {
+                    Some(u) => self.navigate(&u),
+                    None => self.hide_palette(),
                 }
                 return;
             }
@@ -1998,6 +2022,7 @@ impl App {
             58 => Some(gdk::Key::m),
             39 => Some(gdk::Key::s),
             38 => Some(gdk::Key::a),
+            29 => Some(gdk::Key::y),
             _ => None,
         };
         let k = match physical {
@@ -2034,7 +2059,11 @@ impl App {
         }
         if self.palette_open() {
             let mode = self.mode.get();
-            let ctrl = m == M::CONTROL_MASK && mode == Mode::Tabs;
+            let ctrl = m == M::CONTROL_MASK && matches!(mode, Mode::Tabs | Mode::History);
+            if mode == Mode::History && k == gdk::Key::Delete && m == M::SHIFT_MASK {
+                self.forget_selected();
+                return true;
+            }
             let dir = match k {
                 gdk::Key::Down if m.is_empty() => Some(1),
                 gdk::Key::Up if m.is_empty() => Some(-1),
@@ -2044,7 +2073,7 @@ impl App {
             };
             if let Some(d) = dir {
                 match mode {
-                    Mode::Tabs => self.tabs_move(d),
+                    Mode::Tabs | Mode::History => self.tabs_move(d),
                     Mode::Find => self.find_step(d),
                     _ => self.sugg_move(d),
                 }
@@ -2123,6 +2152,10 @@ impl App {
                     }
                 }
                 gdk::Key::q => self.win.close(),
+                gdk::Key::y if !self.palette_open() => {
+                    self.exit_overview();
+                    self.open_palette(Mode::History);
+                }
                 gdk::Key::p if !self.palette_open() => self.toggle_pin(),
                 gdk::Key::m if !self.palette_open() => self.toggle_mute(),
                 _ => return false,

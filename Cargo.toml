@@ -6,6 +6,7 @@ description = "A tiny browser that scrolls sideways: niri-style tabs on the syst
 rust-version = "1.85"
 
 [dependencies]
+age = "0.11"
 gtk4 = { version = "0.11.5", features = ["v4_12"] }
 webkit6 = "0.6.1"
 
